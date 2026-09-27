@@ -1,0 +1,120 @@
+# Test image. A sibling of `Dockerfile`, which is left untouched.
+#
+#   docker build -f Dockerfile.test -t agent-harness-tests .
+#   docker run --rm agent-harness-tests
+#
+# Two separate files rather than one multi-stage build, deliberately: the
+# assignment grades the container that ships the agent (Section 7.3), and a
+# reviewer opening `Dockerfile` should find exactly that image with nothing
+# test-related mixed in. See ADR-027.
+#
+# The base image is the same pinned `python:3.12-slim-bookworm` the brief
+# requires, so the suite runs against the same OS and Python the agent does.
+# A test that passes here genuinely tells you the shipped image works.
+#
+# Build context: `Dockerfile.test.dockerignore` sits next to this file and
+# BuildKit uses it in preference to `.dockerignore`. Buildah has no such
+# file and falls back to `.dockerignore` for every build, so either one may
+# be what this image is built with. Both are therefore written to the same
+# rule — exclude nothing this file copies — and one test checks both
+# (ADR-104). What keeps the *shipped* image free of test code is that
+# `Dockerfile` names every path it copies, not the ignore files.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Runtime dependencies first, then the dev tooling, so editing a test does
+# not reinstall the whole dependency tree. requirements-dev.txt starts with
+# `-r requirements.txt`, so this is one resolved set, not two.
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# The Docker *client*, and only the client — no daemon, no containerd, no
+# buildkit. It is here so the end-to-end tier can run from inside this image
+# when `compose.yaml` hands it the host's socket: those tests start the
+# shipped container, and starting a container needs something to ask.
+#
+# The static tarball rather than `apt-get install docker.io`, which pulls the
+# whole engine (~300 MB) to get a 30 MB binary we then never let it use.
+# TARGETARCH is supplied by BuildKit, so this builds on an Apple-silicon
+# laptop and an x86 runner without a second Dockerfile.
+#
+# CI is unaffected: the `gate` job installs requirements-dev.txt directly and
+# never builds this image, so adding a download to it cannot make the
+# pipeline depend on download.docker.com.
+ARG TARGETARCH
+ARG DOCKER_CLI_VERSION=27.3.1
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) cli_arch=x86_64 ;; \
+        arm64) cli_arch=aarch64 ;; \
+        *) echo "no Docker CLI build for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    python -c "import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], '/tmp/docker.tgz')" \
+        "https://download.docker.com/linux/static/stable/${cli_arch}/docker-${DOCKER_CLI_VERSION}.tgz"; \
+    tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
+    rm /tmp/docker.tgz; \
+    docker --version
+
+# Configuration for pytest, coverage, ruff and mypy all lives in
+# pyproject.toml, so the container runs with exactly the repository's
+# settings rather than tool defaults.
+#
+# compose.yaml and Dockerfile are test *input*, not configuration:
+# tests/unit/test_compose_volumes.py asserts the volume names are pinned to
+# the same identifiers `docker run -v` uses (ADR-054), and
+# tests/unit/test_container_entrypoint.py asserts the shipped image declares
+# an ENTRYPOINT so that `docker run <image> "task"` reaches argparse
+# (ADR-076). README.md joins them for the same reason again: the metrics
+# port is written down in three places — config.yaml, compose.yaml and the
+# documented `docker run` — and a test asserts all three agree (ADR-081).
+#
+# A file a test reads has to be in the image, or the test errors here while
+# passing on a developer's machine. That has now happened four times: the
+# entrypoint test (Dockerfile), the README port check, the Prometheus /
+# Grafana stack tests (`observability/`), and the env-isolation pin
+# (`.env.example`). `run.sh` is the fifth: a test pins that it stays a forwarder to scripts/run.sh rather than
+# growing its own copy of the argument parsing (ADR-104). Before asserting
+# on a committed file, check it is on this line.
+COPY pyproject.toml config.yaml compose.yaml Dockerfile Dockerfile.test README.md .env.example run.sh ./
+COPY harness ./harness
+COPY mcp_server_time_plus ./mcp_server_time_plus
+COPY mcp_server_web_search ./mcp_server_web_search
+COPY mcp_server_calendar ./mcp_server_calendar
+COPY tests ./tests
+COPY scripts ./scripts
+# Wiring between compose.yaml, config.yaml, prometheus.yml and the Grafana
+# dashboard: tests/unit/test_observability_stack.py reads the tree as input
+# (ADR-083). Without this COPY the seven tests FileNotFoundError in the
+# image and pass on a laptop.
+COPY observability ./observability
+# The shipped skills are test *input*: tests/unit/test_example_skills.py
+# loads this directory and asserts the library is not empty, which is how
+# the `*.md` rule in .dockerignore is stopped from silently emptying the
+# agent's skill library again (ADR-038).
+COPY skills ./skills
+
+# The test image gets its own empty workspace and never mounts the real one.
+#
+# This is the isolation that matters: the suite must not be able to read or
+# corrupt whatever the agent produced during a demo. In practice the tests
+# never touch this directory at all — every test that needs a sandbox uses
+# pytest's `tmp_path`, which is created and cleaned per test — so the folder
+# staying empty after a run is itself evidence the isolation holds.
+RUN useradd --create-home --uid 1000 agent \
+    && mkdir -p /app/workspace /app/memory \
+    && chmod +x /app/scripts/ci-gate.sh \
+    && chown -R agent:agent /app
+USER agent
+
+# No LLM_API_KEY is set, and none should be passed in. The suite must
+# pass with no token so that CI and the TAs can run it; the single live test
+# is marked and skips on its own.
+
+# The full gate — style, lint, types, tests, coverage — so one command gives
+# the same verdict CI does. Override it to run something narrower, e.g.
+#   docker run --rm agent-harness-tests pytest -k tools -v
+CMD ["./scripts/ci-gate.sh"]

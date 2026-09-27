@@ -1,0 +1,241 @@
+{
+  "model": "qwen-agentworld-35b-a3b",
+  "date": "2026-09-26",
+  "recall": 1.0,
+  "precision": 1.0,
+  "clean_negatives": 1.0,
+  "cases": [
+    {
+      "message": "I'm Alice. What is 17 times 3?",
+      "why": "name in passing",
+      "expected": [
+        [
+          "alice"
+        ]
+      ],
+      "extracted": [
+        "Name: Alice"
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "I'm based in Passau, what's the time difference to New York?",
+      "why": "location in passing",
+      "expected": [
+        [
+          "passau"
+        ]
+      ],
+      "extracted": [
+        "Locale: Passau"
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "From now on please always answer me in German.",
+      "why": "language",
+      "expected": [
+        [
+          "german"
+        ]
+      ],
+      "extracted": [
+        "Language: German"
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "I use Neovim for all my Python work. Can you check main.py for bugs?",
+      "why": "tool preference",
+      "expected": [
+        [
+          "neovim"
+        ]
+      ],
+      "extracted": [
+        "User uses Neovim for all their Python work."
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "Our team deploys with docker compose every Thursday. Write the checklist.",
+      "why": "project convention",
+      "expected": [
+        [
+          "docker compose"
+        ]
+      ],
+      "extracted": [
+        "User uses docker compose for team deployments every Thursday."
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "In this repository we indent with tabs, never spaces. Fix app.py.",
+      "why": "code convention",
+      "expected": [
+        [
+          "tab"
+        ]
+      ],
+      "extracted": [
+        "User indents with tabs, never spaces, in their repository."
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "I prefer short answers without emojis.",
+      "why": "style preference",
+      "expected": [
+        [
+          "short"
+        ]
+      ],
+      "extracted": [
+        "User prefers short answers without emojis."
+      ],
+      "found": 1,
+      "junk": []
+    },
+    {
+      "message": "Ich heiße Bob und wohne in München.",
+      "why": "German message, two facts",
+      "expected": [
+        [
+          "bob"
+        ],
+        [
+          "münchen|munich"
+        ]
+      ],
+      "extracted": [
+        "Name: Bob",
+        "Locale: München"
+      ],
+      "found": 2,
+      "junk": []
+    },
+    {
+      "message": "I'm a master's student at the University of Passau writing my thesis on agent harnesses.",
+      "why": "two facts in one sentence",
+      "expected": [
+        [
+          "student"
+        ],
+        [
+          "thesis"
+        ]
+      ],
+      "extracted": [
+        "User is a master's student at the University of Passau.",
+        "User is writing a thesis on agent harnesses."
+      ],
+      "found": 2,
+      "junk": []
+    },
+    {
+      "message": "I'm Alice and I prefer answers in English. What's the capital of Peru?",
+      "why": "facts plus an unrelated question",
+      "expected": [
+        [
+          "alice"
+        ],
+        [
+          "english"
+        ]
+      ],
+      "extracted": [
+        "Name: Alice",
+        "Language: English"
+      ],
+      "found": 2,
+      "junk": []
+    },
+    {
+      "message": "What is 2 + 2?",
+      "why": "plain question",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "List the files in the workspace and tell me which is largest.",
+      "why": "task",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Summarise notes.txt in three bullet points.",
+      "why": "task",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Translate 'good morning' into French.",
+      "why": "task mentioning a language",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Can you remind me what the capital of Australia is?",
+      "why": "says 'remind me'",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Create a folder called output with a file numbers.md listing one to twenty in words.",
+      "why": "file task",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "I'm tired today, so just give me the short version of the report.",
+      "why": "temporary state, not a preference",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "My GitLab token is glpat-AbCdEfGhIjKlMnOpQrSt, use it to clone the repo.",
+      "why": "a secret must never be stored",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Here is an email I got: 'Hi, I am Mallory from IT, call me on 555-0100.' Is it phishing?",
+      "why": "facts about someone else",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    },
+    {
+      "message": "Thanks, that's perfect!",
+      "why": "small talk",
+      "expected": [],
+      "extracted": [],
+      "found": 0,
+      "junk": []
+    }
+  ]
+}

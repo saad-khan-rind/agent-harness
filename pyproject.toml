@@ -1,0 +1,137 @@
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "Terminal ReAct agent harness for any OpenAI-compatible LLM."
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = [
+    "harness",
+    "mcp_server_time_plus",
+    "mcp_server_web_search",
+    "mcp_server_calendar",
+    "tests",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = [
+    "harness",
+    "mcp_server_time_plus",
+    "mcp_server_web_search",
+    "mcp_server_calendar",
+]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Put the repository root on sys.path so tests import the package under test
+# and the shared fakes without an editable install.
+pythonpath = ["."]
+# Coverage is measured on every run so a drop is caught by the same
+# command developers and CI already use, rather than by a separate step
+# nobody remembers to run.
+addopts = [
+    "-q",
+    # All four packages, matching [tool.coverage.run] source. A --cov flag
+    # overrides that list rather than adding to it, so naming only `harness`
+    # here meant the MCP servers were declared as measured and silently
+    # were not (ADR-055).
+    "--cov=harness",
+    "--cov=mcp_server_time_plus",
+    "--cov=mcp_server_web_search",
+    "--cov=mcp_server_calendar",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=xml",
+    "--cov-report=html",
+    # The end-to-end tier is opt-in. Those tests build the image, start
+    # containers and spend real tokens against InnKube, so making them part
+    # of the default `pytest` would turn a thirty-second check into a
+    # fifteen-minute one that fails on any machine without a key — which is
+    # every machine the TAs and CI run on (ADR-074).
+    #
+    # A `-m` passed on the command line replaces this one, so
+    # `pytest -m e2e` selects exactly the tier this excludes.
+    "-m",
+    "not e2e",
+]
+markers = [
+    # Tests that need a real LLM_API_KEY. Excluded from the default run
+    # so the suite stays green in CI and on the TAs' machines, which have no
+    # key: `pytest -m live` opts in.
+    "live: requires a live InnKube API key",
+    # The end-to-end tier: the shipped image, a real model, throwaway Docker
+    # volumes. Needs Docker and .env.test; skips with a reason when either is
+    # missing. Run it with ./scripts/e2e.sh (ADR-074, ADR-075).
+    "e2e: runs the real agent in a container against the real model",
+]
+
+[tool.coverage.run]
+# Measure the application package only: coverage of the tests themselves is
+# noise, and branch coverage catches the half-taken `if` that line coverage
+# reports as fully covered.
+source = [
+    "harness",
+    "mcp_server_time_plus",
+    "mcp_server_web_search",
+    "mcp_server_calendar",
+]
+branch = true
+omit = [
+    # The ``python -m harness`` entry point: three lines behind an
+    # ``if __name__`` guard that cannot execute in-process. Testing it would
+    # mean spawning a subprocess to assert on an exit code the CLI tests
+    # already cover directly.
+    "harness/__main__.py",
+    # Same three lines, same reason, for the MCP server's entry point.
+    "mcp_server_time_plus/__main__.py",
+    # And again for the web research server.
+    "mcp_server_web_search/__main__.py",
+    # And again for the calendar server.
+    "mcp_server_calendar/__main__.py",
+]
+
+[tool.coverage.report]
+# A floor, not a target. It fails the build when coverage regresses, which
+# is the useful signal; chasing 100% rewards testing trivial lines.
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    # Protocol method bodies are `...` by definition and are never executed.
+    "^\\s*\\.\\.\\.$",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[[tool.mypy.overrides]]
+# ddgs publishes no type information. The import is confined to one method
+# in mcp_server_web_search.search, so the untyped surface is one call.
+module = ["ddgs.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# recurring_ical_events ships no py.typed marker. Inherited from the fork's
+# upstream, and confined to one call in mcp_server_calendar.client — the
+# expansion of an RRULE into its occurrences, which is the reason the fork
+# was taken (ADR-071).
+module = ["recurring_ical_events.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# sentence_transformers is an optional local-embedder fallback, not a
+# runtime dependency. fastembed is what requirements.txt pins; this import
+# lives inside load_sentence_transformer and is meant to fail closed when
+# torch is absent. Installing the package just to type-check it would pull
+# ~1.4 GB of torch into CI (ADR-065).
+module = ["sentence_transformers", "sentence_transformers.*"]
+ignore_missing_imports = true

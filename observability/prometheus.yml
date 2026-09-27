@@ -1,0 +1,25 @@
+# Prometheus scrape configuration for the compose stack (ADR-083).
+#
+# One job, one target. Inside the compose network the harness answers to its
+# service name, and the port is the one `metrics_port` in config.yaml names —
+# tests/unit/test_observability_stack.py keeps the two in step.
+#
+# Five seconds rather than the default fifteen: a demo run is a few minutes
+# long and the dashboard needs to move while a person is watching it. The
+# cost is nothing at one target.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Alert rules. Evaluated by Prometheus and routed nowhere: there is no
+# on-call rota for a lab harness, so the value is in the expressions being
+# written down, checkable with `promtool check rules`, and visible under
+# Alerts in the Prometheus UI. Adding Alertmanager later is a compose
+# service and a `route` block, with no change to this file (ADR-097).
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: harness
+    static_configs:
+      - targets: ["harness:9091"]

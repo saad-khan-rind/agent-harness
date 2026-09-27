@@ -1,0 +1,112 @@
+# Alert rules: the five conditions worth waking somebody for.
+#
+# Deliberately few. A dashboard can afford a panel that is merely
+# interesting; an alert cannot, because an alert that fires for something
+# nobody acts on trains people to ignore the ones that matter. Each rule
+# below names an action in its annotation, and a rule we could not write an
+# action for did not get written.
+#
+# Prometheus evaluates these; nothing routes them anywhere. That is the
+# honest shape for a lab harness — there is no on-call rota — and it keeps
+# the rules checkable in the expression browser and in `promtool check
+# rules`. Adding Alertmanager later is a compose service and a `route`
+# block, with no change here (ADR-097).
+#
+# The `for:` durations are short because a demo is minutes long. In a real
+# deployment they would be tens of minutes: every one of these conditions is
+# normal for a moment and only meaningful when it persists.
+
+groups:
+  - name: harness-availability
+    rules:
+      # The harness itself is not answering scrapes. Everything below this
+      # is unknowable while it fires, so it comes first.
+      - alert: HarnessDown
+        expr: up{job="harness"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The harness is not serving /metrics"
+          description: >-
+            Prometheus cannot scrape the harness on its metrics port. Either
+            the process is not running, or the exporter failed to bind and
+            the banner said so at startup. Check `docker compose ps` and the
+            harness's first ten lines of output; a closed port is a warning
+            there, never a crash.
+
+      # A gauge that does not come back down. `on_run_end` fires from the
+      # loop's `finally`, so this can only be a hook that raised or a
+      # process that was killed mid-run — and in either case the numbers
+      # above it are now wrong in a way no panel makes obvious.
+      - alert: ActiveRunsStuck
+        expr: sum(harness_active_runs) > 0 and rate(harness_runs_total[10m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Runs are active but none are finishing"
+          description: >-
+            `harness_active_runs` is above zero while no run has completed
+            for ten minutes. Either a run is genuinely stuck on a slow model
+            call — check the LLM latency panel — or a run ended without
+            `on_run_end` firing and the gauge has drifted. The trace file for
+            the newest run id tells you which.
+
+  - name: harness-failures
+    rules:
+      # The one alert that points at a layer rather than at a symptom.
+      # Deliberately keyed on the *model* and *mcp* layers only: a policy
+      # denial is the harness working, a guard stopping a run is the harness
+      # working, and an agent choosing badly is not something an alert can
+      # help with at 3am.
+      - alert: InfrastructureFailures
+        expr: >-
+          sum(rate(harness_errors_total{layer=~"model|mcp"}[10m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The model endpoint or an MCP server is failing"
+          description: >-
+            Failures attributed to the model or MCP layers are sustained.
+            Open the "Failures by layer" panel to see which, then
+            "Error types" for the reason. `llm.rate_limited` is the shared
+            cluster being busy and usually resolves itself;
+            `mcp.connection` is a server subprocess that died and needs the
+            harness restarted.
+
+      # Thrash. This is the early warning for the no-progress guard: by the
+      # time that fires the run is already over, whereas a rising rate here
+      # means prompts or tool descriptions need work while there is still
+      # something to fix.
+      - alert: AgentsRepeatingThemselves
+        expr: sum(rate(harness_repeated_tool_calls_total[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Agents are re-issuing identical tool calls"
+          description: >-
+            Tool calls with byte-identical arguments are being repeated
+            across runs. This is almost never a tool problem: it means a
+            tool's description is ambiguous enough that the model cannot
+            tell its call failed, or a prompt does not say what to do next.
+            The trace for any affected run shows the repeated fingerprints.
+
+      # Self-observability. If this fires, nothing else on the dashboard can
+      # be trusted — which is exactly why the count is published rather than
+      # swallowed.
+      - alert: TelemetryLosingSpans
+        expr: sum(harness_telemetry_spans_dropped) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The telemetry layer is dropping spans"
+          description: >-
+            An exporter refused or lost spans. The run itself is unaffected
+            by design — an observer must never fail a task — but the
+            evidence is now incomplete. Usually a full disk under the traces
+            directory, or an OTLP collector that is configured and
+            unreachable.

@@ -1,0 +1,59 @@
+# Build context for Dockerfile.test ONLY.
+#
+# BuildKit looks for `<dockerfile-name>.dockerignore` first and uses it
+# instead of `.dockerignore` for that build. So this file decouples the two
+# images:
+#
+#   docker build .                        -> uses .dockerignore
+#   docker build -f Dockerfile.test .     -> uses this file
+#
+# Buildah — and therefore `podman build` — has no per-Dockerfile ignore file
+# at all and falls back to `.dockerignore` for every build. Which means a
+# machine may use either file for this image, and *neither* may exclude what
+# `Dockerfile.test` copies. Both are written to the same rule and one test
+# checks both (ADR-104).
+#
+# The rule: exclude nothing the image copies, rather than exclude broadly
+# and re-include with `!`. Negation is in the spec, but the re-includes did
+# not take effect on the Podman path and the build failed on a
+# `COPY … README.md` for a file plainly in the checkout. There is now
+# nothing left to negate.
+
+# Version control and local virtualenvs.
+.git
+.venv
+venv
+
+# Build and tool caches. Coverage output especially: copying a previous
+# run's .coverage into the image would skew a fresh report.
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+coverage.xml
+.coverage
+
+# The real secrets. The suite is designed to pass with no token, so neither
+# must be in this context: .env is the demo's, .env.test is the end-to-end
+# tier's (ADR-075). The gate never reads either.
+#
+# `.env.example` is NOT excluded — it is test input, and Dockerfile.test
+# copies it.
+.env
+.env.test
+.env.test.example
+
+# Prose neither image builds from. Directories, not `*.md`: that pattern
+# also caught `README.md` (the port-agreement test, ADR-081), every
+# `skills/**/SKILL.md` (ADR-038) and the forks' `NOTICE.md` (ADR-044).
+docs
+
+# Runtime state, never build input (ADR-035, ADR-065).
+workspace
+memory
+agent_memory_db
+
+# NOTE: `tests/`, `scripts/` and `observability/` are deliberately NOT
+# listed — Dockerfile.test copies all three.

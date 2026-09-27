@@ -1,0 +1,645 @@
+# Non-secret harness defaults. Environment variables always override these.
+# Do NOT put LLM_API_KEY here: it must never be committed.
+
+# --- LLM provider (ADR-121) ---------------------------------------------------
+# Any OpenAI-compatible provider works; this picks the default endpoint and
+# model. One of:
+#
+#   innkube     https://llms.innkube.fim.uni-passau.de   qwen-agentworld-35b-a3b
+#   gemini      Google AI Studio (OpenAI endpoint)        gemini-2.5-flash
+#   openai      https://api.openai.com/v1                 gpt-4.1-mini
+#   groq        https://api.groq.com/openai/v1            llama-3.3-70b-versatile
+#   openrouter  https://openrouter.ai/api/v1              openai/gpt-4.1-mini
+#   mistral     https://api.mistral.ai/v1                 mistral-large-latest
+#   ollama      http://host.docker.internal:11434/v1      qwen2.5:14b
+#   custom      any other OpenAI-compatible server: set llm_base_url and
+#               llm_model yourself
+#
+# Usually you switch provider in .env (LLM_PROVIDER=gemini) rather than here.
+# The model must support tool (function) calling.
+llm_provider: innkube
+
+# Leave these empty to use the provider's defaults above. Setting them here
+# pins them for every provider, so prefer LLM_BASE_URL / LLM_MODEL in .env.
+llm_base_url: ""
+llm_model: ""
+
+# Seconds to wait for one completion. Self-hosted and shared models can be
+# slow; a long timeout with a clear error beats a fast, confusing failure.
+llm_timeout: 600
+
+# --- Observability (Week 3, §8.4) -------------------------------------------
+# The harness publishes Prometheus metrics on its own HTTP port. Prometheus
+# scrapes it; nothing is pushed, so the agent needs no network egress to be
+# observable.
+#
+#   docker compose up -d prometheus grafana   # the stack
+#   curl -s localhost:9091/metrics | grep harness_
+#
+# A bare `docker run` needs the port published to see them:
+#   docker run --rm -it --env-file .env -p 9091:9091 agent-harness
+#
+# If the port is already taken the exporter stays off, the banner says so,
+# and the run continues. Monitoring is how you watch the agent work, not part
+# of the work — the same call ADR-069 makes for a missing Qdrant (ADR-081).
+metrics_enabled: true
+metrics_port: 9091
+
+# The other half: one JSONL file per agent run, so a single run — including
+# the sub-agent runs it delegated — can be read step by step. Metrics answer
+# "how is it doing"; the trace answers "what did it do".
+#
+# Written to {memory_path}/{traces_dirname}/{run_id}.jsonl. Under the memory
+# root rather than the workspace so the file tools cannot reach it and so it
+# survives `--rm` on the same volume memory does. `traces_dirname` is a bare
+# name, never a path — the location is decided by memory_path (ADR-083).
+#
+#   docker compose run --rm harness      # then, on the memory volume:
+#   docker run --rm -v agent-harness-memory:/m alpine ls /m/traces
+#
+# An unwritable directory switches the trace off for that run and the run
+# continues — same rule as a closed metrics port.
+traces_enabled: true
+traces_dirname: traces
+
+# What telemetry may record about a tool call's ARGUMENTS.
+#
+#   strict   nothing derived from arguments at all.
+#   shapes   key names, value types and sizes ("path=str[18] content=
+#            str[4213]"), plus a fingerprint. The default. No argument value
+#            ever leaves the process.
+#   values   truncated values as well, with secret-looking keys still
+#            removed. A local debugging setting, and the banner says when it
+#            is on — a mode that quietly starts logging file contents is a
+#            mode somebody will forget is enabled.
+#
+# Tool OUTPUT is never recorded at any setting: only its length. An
+# observation can contain a whole file the user never looked at, whereas an
+# argument is something they chose to send.
+#
+# The fingerprint is a short hash of the normalised arguments and is
+# available in every mode including `strict`, because a hash discloses
+# nothing. What it gives is equality — two calls with the same fingerprint
+# are the same call — which is exactly what makes a model going round in
+# circles visible without recording what it was doing (ADR-094).
+telemetry_redaction: shapes
+
+# Optional OpenTelemetry export, so the same spans can be opened in Jaeger
+# or Grafana Tempo. OFF by default, and off in three independent ways: this
+# flag, whether the opentelemetry packages are installed, and whether the
+# collector answers. None of the three can fail a run — the exporter hands a
+# span to a background thread and returns, so a dead collector costs the
+# agent nothing (ADR-095).
+#
+# This does NOT replace Prometheus. The brief requires Prometheus-compatible
+# metrics and we keep them: metrics answer "how is the fleet doing", traces
+# answer "what did this one run do", and a trace viewer is about the second.
+#
+#   ./run.sh --tracing             # starts Jaeger and turns this on
+#
+# or by hand: `docker compose --profile tracing up -d` plus
+# `otlp_enabled: true` here (or OTLP_ENABLED=true in .env). After each answer
+# the agent prints a direct link to that run's trace.
+#
+# Two addresses, and they are not the same thing (ADR-111):
+#   otlp_endpoint  where the harness SENDS spans. localhost is right only
+#                  when the harness runs on the host. Inside compose it is
+#                  http://jaeger:4318, which compose.yaml sets for you; with
+#                  a bare `docker run`, use http://host.docker.internal:4318.
+#   otlp_ui_url    where YOU open the viewer, from your browser.
+#
+# A hosted collector's API key goes in OTEL_EXPORTER_OTLP_HEADERS in the
+# environment, never here: this file is committed (brief 8.2).
+otlp_enabled: false
+otlp_endpoint: http://localhost:4318
+otlp_ui_url: http://localhost:16686
+otlp_service_name: agent-harness
+
+# --- Token budget (ADR-088, ADR-089) ------------------------------------------
+# Two allowances with different jobs.
+#
+# The *window* allowance is about money: a rolling 24 hours of prompt +
+# completion tokens, counted across every session that shares the memory
+# volume, sub-agents included, in {memory_path}/budget.json. It opens on the
+# first charged call — not at startup, not at midnight — and ends 24 hours
+# later, so the allowance does not depend on what time of day you begin
+# (ADR-089). The after-answer line shows where it stands:
+#
+#   budget: 42,310 / 1,000,000 tokens in 24h (4%) · 957,690 left · resets 14:20 CEST
+#
+# Once it is spent the harness makes no further model calls. Say
+# "use credit on the go" to carry on anyway: the overspend is recorded in its
+# own counter and the line is marked ON CREDIT. That consent lasts for the
+# session only — it is deliberately not persisted.
+#
+# The check happens *before* a call and the cost is only known *after* it, so
+# the last call can overshoot by its own size — a few thousand tokens against
+# a million.
+#
+# Sizing, from the traces on this cluster: ~6k prompt tokens per call (system
+# prompt, tool schemas, memory and skill index), 15-25k per ordinary turn,
+# ~112k for the heaviest scenario in Week2_Scenarios.md. A million is a full
+# demo day with headroom. Env override: BUDGET_DAILY_TOKENS.
+budget_enabled: true
+budget_daily_tokens: 1000000000
+
+# The *per-prompt* allowance is about runaways: the most one instruction may
+# cost before a person is asked whether it is still worth it. Crossing it is
+# not an error — the work so far is kept and the run pauses, so typing
+# "continue" picks the same task up on a fresh allowance. A child's tokens
+# count against the instruction that delegated it. 0 switches the checkpoint
+# off, which is the pre-ADR-089 behaviour.
+#
+# Raised with max_context_chars (ADR-109). A full request is now ~16k tokens
+# of context plus ~4k of tool schemas, so 400,000 still allows ~20 full-size
+# model calls before the pause — about what 200,000 allowed at the old
+# 24,000-character context. Leaving it at 200,000 would have made a long task
+# pause twice as often for no reason but the bigger window.
+budget_prompt_tokens: 400000
+
+# Share of the window allowance past which the budget line turns yellow.
+# Display only; the limit above is what is enforced.
+budget_warn_fraction: 0.8
+
+# Specialized sub-agents (§8.4). The top-level agent gets one extra tool,
+# `delegate(role, task, ...)`, which hands a self-contained piece of work to a
+# registered specialist — researcher, writer or critic. Each runs as a real
+# child agent run: its own system prompt, its own fresh context, its own
+# filtered tool set, its own permission mode and its own budget, linked to the
+# parent run in the trace and in the metrics (ADR-084).
+#
+# Nothing here can widen anything. A specialist's permission mode is narrowed
+# against `permission_mode` below, its capabilities are intersected with the
+# tools this session actually has, and its budget is clamped to whatever the
+# parent has left. These numbers only ever tighten (ADR-086).
+#
+#   docker compose run --rm harness      # then, on the memory volume:
+#   docker run --rm -v agent-harness-memory:/m alpine ls /m/traces/delegations
+subagents_enabled: true
+
+# A child's own reason-act ceiling. A real number, unlike max_iterations
+# below, which may be 0: a user can decide their own task has gone on long
+# enough and press Ctrl-C, but nobody is watching a delegated child.
+subagent_max_iterations: 8
+
+# A child's tool-call allowance for its whole run. One iteration can request
+# several calls, so this bounds the runaway the step cap does not: a
+# researcher fetching forty pages in eight steps.
+subagent_max_tool_calls: 20
+
+# Wall-clock ceiling on a child's actions, in seconds. It bounds what a child
+# may start; it cannot interrupt a model call already in flight — that is
+# llm_timeout's job. 0 disables it.
+subagent_timeout_seconds: 120
+
+# How deep delegation may go. 1 means this agent may delegate and a child may
+# not. The primary guard is structural: no specialist holds the delegation
+# capability, so no child registry contains the tool. This is the second lock.
+subagent_max_depth: 1
+
+# How many times a child whose result did not match its declared output
+# contract is asked to restate it. The common failure is packaging rather than
+# substance, so one retry is usually cheaper than re-running the work. 0..3.
+subagent_repair_attempts: 1
+
+# Ceiling on the summary a child hands back to its parent. This is the number
+# that makes "delegation protects the coordinating context" true rather than
+# aspirational.
+subagent_max_result_chars: 2000
+
+# How many children one `delegate` call may run at once, and the longest batch
+# the tool will accept. Independent tasks run concurrently, so three lookups
+# take about as long as the slowest one instead of the sum of all three.
+#
+# Set this to 1 to get the old strictly sequential behaviour back — everything
+# else about delegation is unchanged, so it is a safe thing to try first if a
+# run looks confusing. Three is the default because every child shares one
+# InnKube cluster: a wider fan-out earns rate-limit retries rather than speed,
+# and one person can only answer so many confirmation prompts. Maximum 8.
+subagent_max_concurrency: 3
+
+# Decide delegation at run time. When the agent is about to start reading
+# (a file, a search, a web lookup), it is asked one narrow question: does
+# this request split into independent parts? If it does, those parts go to
+# researcher sub-agents in parallel and the agent combines what comes back.
+# One small extra model call per turn that reads anything; off in a
+# read-only session. Without it the model delegated only when told to by
+# name (ADR-117).
+subagent_auto_plan: true
+
+# Which MCP servers count as web research when a specialist's capabilities are
+# resolved into tool names. Named rather than inferred from the prefix: the
+# calendar server is remote too, and a researcher granted web search must not
+# pick up the ability to write calendar entries along the way.
+subagent_web_servers:
+  - web
+
+# Confine the model to a skill's declared `allowed-tools` while that skill is
+# in context. Off by default: it is a real restriction on a running agent, and
+# one wrong entry in a skill's frontmatter becomes a tool the model cannot
+# call for reasons the transcript does not explain. Turn it on to demonstrate
+# skill-scoped permissions (ADR-082).
+skills_enforce_allowed_tools: false
+
+# The zone the agent thinks in. This is what "today", "tomorrow" and "next
+# Monday" mean in its system prompt, and it MUST match the --local-timezone
+# passed to the time_plus and calendar servers below — otherwise the agent
+# books "Monday 17:00" in one zone and the calendar stores it in another.
+# tests/unit/test_config.py asserts the three stay in step (ADR-079).
+timezone: Europe/Berlin
+
+# Low temperature: this agent selects tool calls, where consistency beats
+# variety.
+temperature: 0.2
+
+# Optional ceiling on reason-act cycles per task. 0 means no fixed cap: a
+# long task is not cut off at an arbitrary number of turns, and the loop
+# still counts and displays the iteration it is on. Termination is then
+# carried by the other guards — the per-tool failure limit below, the
+# per-call timeout, and Ctrl-C (ADR-047).
+#
+# Set a positive number to restore a hard ceiling, which is the right choice
+# for an unattended run.
+max_iterations: 0
+
+# Consecutive failures of a single tool before the loop stops calling it for
+# the rest of the task and tells the model it is unavailable. A success
+# resets the count. This is what bounds the common runaway: a model that
+# calls a broken tool, reads the error, and calls it again unchanged. 0
+# disables the guard (ADR-048).
+max_tool_failures: 5
+
+# Identical calls in a row before the run stops as making no progress: same
+# tool, same arguments, and the same observation back. This is the backstop
+# that makes termination hold with no iteration cap, and it is set well
+# above max_tool_failures on purpose — a failing tool should be retried and
+# then retired with an explanation, not cut off mid-recovery. Ten identical
+# results means the model ignored that explanation too. 0 disables it
+# (ADR-049).
+max_repeated_calls: 10
+
+# A reply that ends the turn saying "I have created ..." when no tool ran
+# since your message is sent back once with a note, so the model acts or
+# corrects itself instead of reporting work it did not do. Costs one extra
+# model call, and only on such a reply (ADR-116).
+claim_check_enabled: true
+
+# Retry policy for transient InnKube failures (429, 500, 502, 503, 504,
+# timeouts, connection errors). The cluster is shared by the whole class, so
+# rate limits are expected. Total attempts are max_retries + 1; backoff is
+# exponential with full jitter, capped at retry_max_delay seconds, and a
+# server-sent Retry-After header wins when present.
+max_retries: 3
+retry_base_delay: 1.0
+retry_max_delay: 30.0
+
+# --- Permissions (ADR-057, ADR-102) -----------------------------------------
+# Checked on every tool call the model makes, in one place in the loop, so
+# file tools, memory tools, skill tools and MCP tools are all policed the
+# same way rather than as special cases (brief section 8.4).
+#
+# Every tool has a TIER — allow, ask or deny — decided from, in order:
+#
+#   1. the deny-list      delete/remove/rename-shaped names, and denied_tools
+#                         below: deny, and nothing can override it (ADR-008)
+#   2. permission_rules   the patterns below, deny before ask before allow
+#   3. the server         an mcp_servers entry's `permission:` line
+#   4. reach              a tool that talks to the open world (web search,
+#                         web fetch, an unannotated MCP tool) is ask, even
+#                         when it only reads: the query itself leaves the
+#                         machine
+#   5. risk               a tool that changes state (file writes, memory,
+#                         calendar, delegate to the writer) is ask; a read
+#                         inside the sandbox is allow, and so is delegating
+#                         to a read-only researcher or critic (ADR-119)
+#
+# The MODE says what `ask` means in this session:
+#
+#   confirm_mutations  ask on the terminal before running it. The
+#                      interactive setting. With no terminal to ask on, the
+#                      answer is no.
+#   allow_all          run it. For unattended runs, which have nobody to
+#                      ask and are already held by path confinement
+#                      (ADR-007), the absence of any delete tool (ADR-008)
+#                      and the MCP deny-list (ADR-042).
+#   deny_mutations     refuse a write; let an open-world read through. The
+#                      read-only session.
+#   auto               confirm_mutations when stdin is a terminal,
+#                      allow_all otherwise. The default: a person at a REPL
+#                      is asked, a `docker run` with a task or a CI job is
+#                      not — and is not silently refused everything either.
+#
+# Override for one run with `--permissions <mode>`. `/tools` in the REPL
+# lists every tool with its tier and where the tier came from.
+permission_mode: auto
+
+# Name patterns that set a tool's tier ahead of its reach and risk. Globs
+# over the full registered name, case-insensitive; `web__*` is every tool on
+# the server named `web`. deny beats ask beats allow, whatever is more
+# specific — an allow rule cannot carve a hole in a deny rule.
+#
+# Empty by default: the shipped servers are annotated, so their tiers are
+# already right (time and calendar queries allow, web search and fetch ask,
+# calendar writes ask). Examples of what goes here:
+#
+#   permission_rules:
+#     deny:  ["calendar__add_*"]   # this deployment may not book anything
+#     ask:   ["memory_*"]          # every long-term memory write
+#     allow: ["web__web_search"]   # trusted enough to run unprompted
+permission_rules:
+  deny: []
+  ask: []
+  allow: []
+
+# Exact tool names refused whatever the mode is. The word-based deny-list in
+# harness/tools/base.py already keeps delete-shaped tools out; this is for
+# naming one specific tool you do not want this deployment to have.
+denied_tools: []
+
+# Sandbox root. Relative paths resolve against the working directory, which
+# is /app inside the container.
+workspace_path: workspace
+
+# Context budget: the longest a single tool observation may be before it is
+# truncated, and the most search_text / find_files hits reported at once.
+max_tool_output_chars: 4000
+max_search_results: 50
+
+# Conversation-wide budget in characters. When the message list grows past
+# this, older tool observations are stubbed, and so are payload-sized
+# arguments on older tool calls — on a bulk task that second half is most of
+# the size (ADR-090). What was removed is listed back to the model under
+# "## Earlier work (compacted)" in the system prompt, so it can tell what it
+# has already done without redoing a call to find out. 0 disables compaction.
+# Not a token cap: InnKube often omits usage.
+#
+# Sized from the model, not guessed (ADR-109). InnKube's model list gives
+# qwen-agentworld-35b-a3b 262,144 tokens and gemma4-31b-it 131,072; measured
+# on qwen, this harness's prompts and code run at ~4 characters per token.
+# 64,000 characters is ~16,000 tokens: 6% of qwen's window, 12% of gemma's.
+# The window is not what limits this number — two other things are:
+#   * context rot: models get worse as the window fills, and the brief asks
+#     for "the smallest set of high-signal tokens", so the budget stays a
+#     small fraction of the window rather than filling it;
+#   * cost per instruction: every call resends the whole context, so this
+#     number times the calls in a task is what budget_prompt_tokens meters.
+# It was 24000 (~6,000 tokens, 2% of the window), which compacted and folded
+# far earlier than the model needed.
+max_context_chars: 64000
+
+# Tool stubbing bounds one long run; it cannot bound a long chat, because
+# user and assistant messages are never stubbed. So at the start of a turn,
+# after stubbing, if the conversation (not counting the system prompt, and
+# never allowed less than a quarter of max_context_chars) is still over
+# budget, every turn older than
+# the last conversation_keep_turns is folded into one rolling summary under
+# "## Earlier conversation (summarised ...)" in the system prompt, and the
+# folded messages are dropped (ADR-108). Folding always happens when over
+# budget; conversation_summary_llm_enabled only decides who writes the
+# summary — the model (one extra call per fold) or a plain one-line-per-turn
+# fallback that needs no model.
+conversation_keep_turns: 2
+conversation_summary_max_chars: 2000
+conversation_summary_llm_enabled: true
+
+# --- Short-term memory (ADR-090) ----------------------------------------------
+# One markdown file, {memory_path}/notes.md, that the agent keeps its own
+# working state in with note_write / note_append. Injected whole into the
+# system prompt at the start of every run, so a long task can survive its own
+# compaction: the notes are outside the context window and cannot be stubbed.
+# Distinct from long-term memory below — that answers "what do I know about
+# this user" and is queried; this answers "where had I got to" and is always
+# present in full. /reset clears it along with the conversation.
+# One session writes it at a time: the first holds {memory_path}/notes.lock,
+# and a second session started alongside keeps private notes in memory (the
+# banner says so). A restarted session picks the file up again (ADR-110).
+notes_enabled: true
+
+# Ceiling on the notes file. It is sent with every request, so this is a share
+# of the context budget rather than a disk limit; a write past it is refused
+# with the reason rather than silently truncated.
+notes_max_chars: 4000
+
+# --- Long-term memory (ADR-033 to ADR-036, ADR-065 to ADR-070) --------------
+# Durable memory lives in a Qdrant collection, not in files (ADR-065). One
+# thing still lives on disk: the run log the harness appends to at the end
+# of every run, which is read by humans in order and never by similarity
+# (ADR-068).
+#
+# So memory_path is still a root, still a SIBLING of the workspace and
+# never inside it, and startup still refuses an overlapping pair. It is now
+# a smaller guarantee than it was — the facts the agent can write are not
+# on this disk at all, so write_file could not reach them even if the roots
+# did overlap.
+memory_path: memory
+
+# Set to false for a run with no memory loaded, injected, or written.
+memory_enabled: true
+
+# How facts get written (ADR-107). There are two write paths, the pairing
+# current memory layers use:
+#   * hot path — the model calls memory_store / memory_upsert_slot while it
+#     works (always on when memory is on);
+#   * background path — at the end of every top-level run, one extra model
+#     call reads ONLY the user's message (never tool output, so a hostile
+#     file cannot write memory this way) and extracts durable facts, stored
+#     with [harness] provenance. That is memory_extraction_enabled.
+# Every write, from either path or from /remember, is consolidated against
+# its nearest stored facts: an exact repeat is never stored twice, and with
+# memory_consolidation_enabled a model judge files a near-repeat as a
+# duplicate and a changed fact as a correction. A correction marks the old
+# fact superseded_by the new one — hidden from every read, never deleted
+# (ADR-008) — and may not supersede a fact of higher provenance
+# (user > harness > agent). Both switches default to off in code so a
+# scripted test sees no calls it did not script.
+memory_extraction_enabled: true
+memory_consolidation_enabled: true
+
+# Ceiling on the whole injected memory block: project memory plus the facts
+# retrieved for this request. Memory competes with the conversation for the
+# same window, so the budget is explicit rather than whatever the query
+# happens to return.
+memory_max_inject_chars: 4000
+
+# How many core facts the always-injected first tier may carry. A ceiling,
+# not a target: a request matching three facts injects three. Everything
+# else stays in the collection and is reachable with memory_search
+# (ADR-067).
+memory_core_fact_limit: 10
+
+# Where Qdrant listens. localhost is right for running the harness directly
+# on a developer machine; compose overrides it to http://qdrant:6333 for
+# the containerised path, because inside the compose network the database
+# answers to its service name.
+#
+# A Qdrant that is not there is not an error: the harness starts, the
+# banner says memory is unavailable, and the run proceeds without it
+# (ADR-069).
+memory_qdrant_url: http://localhost:6333
+
+# Seconds allowed for one Qdrant request. Short on purpose: it is a
+# container on the same network, and a memory call that hangs for a minute
+# is worse for a run than one that fails fast and degrades.
+memory_qdrant_timeout: 10.0
+
+# Embedding model requested from the same OpenAI-compatible endpoint used
+# for chat. The harness probes it once at startup; a deployment that does
+# not serve embeddings falls back to a local lexical embedder, and the
+# banner says which one is active (ADR-066).
+memory_embedding_model: text-embedding-3-small
+
+# Set false to skip the probe and always embed locally. Right for a demo
+# with no network, and for keeping a collection at one stable vector width
+# — a collection built at 1536 dimensions cannot be queried at 256.
+memory_remote_embeddings: true
+
+# Local embedding model, used when the endpoint above serves no embeddings.
+# This is the normal case here: InnKube is a chat deployment, so without
+# this rung the harness falls back to lexical word matching and a question
+# phrased differently from the stored fact retrieves nothing.
+#
+# Loaded through fastembed (onnxruntime, ~24 MB) when installed, and
+# sentence-transformers (torch, ~1.4 GB) otherwise — same checkpoint, same
+# vectors. Set to "" to skip it and use the lexical embedder.
+memory_local_embedding_model: sentence-transformers/all-MiniLM-L6-v2
+
+# Where that model is cached. The Dockerfile bakes it into /opt/models at
+# build time and this points at it, so a container needs no network and no
+# first-run download. Leave empty outside a container to use the library's
+# own cache directory.
+memory_local_embedding_cache: ""
+
+# Override the active embedder's own similarity floor. Leave null to use it:
+# the floor belongs to the vector space, not to a deployment, so each
+# embedder declares its own. Set this only after measuring with
+# scripts/tune_memory_floor.py against your own facts — a number copied from
+# elsewhere is how the floor came to be wrong in the first place.
+memory_min_similarity: null
+
+# User-authored project memory, looked up inside the workspace. The
+# cross-vendor filename, and the one this repository already uses for team
+# rules. Unlike the memory directory, the agent may edit this file: it lives
+# in the workspace by design, so a project's own rules travel with it.
+project_memory_filename: AGENTS.md
+
+# --- Skills (ADR-038) -------------------------------------------------------
+# Third sandbox root. Read-only and shipped in the image: it is resolved but
+# never created and never written to. A missing directory means no skills,
+# not a startup failure.
+skills_path: skills
+
+skills_enabled: true
+
+# Ceiling on the injected skill index. Only names and descriptions are
+# loaded up front; a body is fetched with skill_read when a skill applies.
+skills_max_inject_chars: 2000
+
+# --- MCP servers (ADR-039 to ADR-043) ---------------------------------------
+# Tools discovered on an MCP server register on the same registry as the
+# built-in ones, so the model sees a single uniform tool list. Adding a
+# server is a configuration change: no code knows any server's name.
+#
+# On by default with an empty list, so a bare `docker run` behaves exactly as
+# it did before. Set to false for a run with no servers started at all.
+mcp_enabled: true
+
+# Seconds allowed for a server to launch and finish its MCP handshake. A
+# server that misses this is reported and skipped; the session continues
+# with the tools that did load.
+mcp_connect_timeout: 30.0
+
+# Each entry launches one server as a subprocess and talks to it over
+# stdin/stdout. Fields:
+#   name         snake_case label, prefixed onto every tool this server
+#                offers ("time__get_current_time"), which is what keeps two
+#                servers offering the same tool name distinguishable.
+#   command/args the program to launch.
+#   transport    'stdio' is the only one implemented; the field exists so
+#                adding HTTP later is an addition, not a reshape.
+#   env          extra environment for the child. Never put a secret here:
+#                this file is committed.
+#   timeout      seconds allowed for one tool call on this server.
+#   enabled      false switches one server off without deleting the entry.
+#   denied_tools extra exact names to refuse, on top of the global word list
+#                that always blocks delete/remove/rename and friends.
+#   permission   allow | ask | deny — the default tier for every tool this
+#                server offers, used when no permission_rules pattern
+#                matched. Leave it unset and the server's own annotations
+#                decide. Set `ask` on a server nobody has reviewed yet
+#                (ADR-102).
+#
+# The server this repository ships: an extension of the reference time
+# server with a meeting-slot finder (ADR-044 to ADR-046). It is launched
+# from inside the agent image as a stdio subprocess, so the brief's single
+# `docker run` still has every tool — no second container, no port, no
+# network listener.
+#
+# `python -m`, not a path: the package is on the image's PYTHONPATH at /app,
+# so the same entry works in the container, in the test image and from a
+# developer's checkout.
+mcp_servers:
+  - name: time_plus
+    command: python
+    args: ["-m", "mcp_server_time_plus", "--local-timezone", "Europe/Berlin"]
+    transport: stdio
+    timeout: 30.0
+    enabled: true
+
+  # The second server this repository ships, and the first proof that the
+  # client aggregates more than one: two servers, two prefixes, one flat
+  # tool list. Web research — `web__web_search` finds pages, `web__web_fetch`
+  # reads one. No API key: the backend needs no account, so the whole team
+  # and CI can run it unchanged (ADR-055).
+  #
+  # Rename `web` here and every tool it offers is renamed with it, which is
+  # the cheapest demonstration of what the prefix is for.
+  # The third server: a fork of adamchrabaszcz/ics-calendar-mcp (MIT),
+  # carrying its five query tools and adding two (ADR-071, ADR-072).
+  #
+  # Two things it does not need, both deliberate. No credentials: upstream
+  # requires an ICS_CALENDAR_URL, and a private calendar feed URL is a
+  # secret the brief forbids committing (8.2), so the fork reads a local
+  # file instead. No network: nothing here leaves the process, so the SSRF
+  # guard the web server carries does not have to be duplicated.
+  #
+  # `suggest_reschedule_slots` composes with time_plus rather than
+  # duplicating it: `find_meeting_slot` knows working hours across
+  # timezones and nothing about what is booked, this one knows what is
+  # booked — recurring meetings included, which is upstream's contribution.
+  - name: calendar
+    command: python
+    args:
+      - "-m"
+      - "mcp_server_calendar"
+      # An absolute path inside the container: the server inherits the
+      # harness's working directory, and a relative path would put a
+      # user's events somewhere that vanishes with the container.
+      - "--calendar-file"
+      - "/app/calendar/calendar.ics"
+      # The zone a time with no offset is read as, and the zone results
+      # come back in. Matches the time_plus default so the two servers
+      # agree about what "09:00" means. Upstream defaults to
+      # Europe/Warsaw, its author's zone.
+      - "--local-timezone"
+      - "Europe/Berlin"
+    transport: stdio
+    timeout: 30.0
+    enabled: true
+
+  - name: web
+    command: python
+    # --contact is a URL or email a site operator can reach you at. It is
+    # sent in the User-Agent and nowhere else. Optional, and most of the
+    # web serves requests without it — but Wikimedia sites answer 403
+    # without one, and Wikipedia is the first hit for a great many
+    # research questions. Add your team address to switch that on:
+    #   args: ["-m", "mcp_server_web_search", "--timeout", "20",
+    #          "--contact", "team@example.com"]
+    args: ["-m", "mcp_server_web_search", "--timeout", "20"]
+    transport: stdio
+    # Longer than time_plus: a search plus a page retrieval crosses the
+    # public internet, where 20s is optimistic and 30s is honest. Must stay
+    # above the server's own --timeout so a slow page produces a readable
+    # error from the server rather than a client-side timeout.
+    timeout: 30.0
+    enabled: true

@@ -1,0 +1,59 @@
+# GitHub Actions for the agent harness.
+#
+# Runs the same `scripts/ci-gate.sh` a developer runs locally and the test
+# image runs by default, so the three can never disagree (ADR-028).
+#
+# No LLM API key is defined here, and none should be added as a secret for
+# these jobs: the default suite is keyless and offline by design. The
+# end-to-end tier needs a real model and Docker, so it runs locally with
+# `./scripts/e2e.sh` (ADR-074, ADR-075).
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Lint, types and tests
+    runs-on: ubuntu-latest
+    # The image the application ships on, so CI tests the same OS and Python.
+    container: python:3.12-slim-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dev dependencies
+        run: pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Run the gate
+        run: ./scripts/ci-gate.sh --junitxml=report.xml
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-reports
+          path: |
+            report.xml
+            coverage.xml
+            htmlcov/
+          retention-days: 7
+
+  container:
+    name: Images build and fail fast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the shipped image
+        run: docker build -t agent-harness .
+      # With no key the image must exit with a readable message, not hang
+      # or print a traceback.
+      - name: Missing key fails fast
+        run: |
+          docker run --rm agent-harness "hello" 2>&1 | tee out.txt || true
+          grep -q "LLM_API_KEY is not set" out.txt
+      - name: Build and run the test image
+        run: |
+          docker build -f Dockerfile.test -t agent-harness-tests .
+          docker run --rm agent-harness-tests

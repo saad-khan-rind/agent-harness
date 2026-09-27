@@ -1,0 +1,46 @@
+# Build context for `docker build .` — and, on Buildah/Podman, for every
+# build, because Buildah has no per-Dockerfile ignore file and falls back to
+# this one for `Dockerfile.test` too. So this file may not exclude anything
+# `Dockerfile.test` copies, and it is held to the same rule as
+# `Dockerfile.test.dockerignore`: exclude nothing the test image copies,
+# and never exclude broadly and re-include with `!`. The negations are in
+# the spec but did not take effect on the Podman path, and the test image
+# failed on a `COPY … README.md` for a file plainly in the checkout. A test
+# checks both files (ADR-104).
+#
+# What keeps `tests/`, the daily reports and the README out of the
+# *shipped* image is `Dockerfile` itself: there is no `COPY . .`, so every
+# path in that image is one somebody wrote down.
+
+# Version control and local virtualenvs.
+.git
+.venv
+venv
+
+# Build and tool caches.
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+coverage.xml
+.coverage
+
+# The real secrets. `.env.example` is NOT excluded — it is test input, and
+# Dockerfile.test copies it.
+.env
+.env.test
+.env.test.example
+
+# Prose neither image builds from. Directories, not `*.md`: that pattern
+# also caught `README.md` (ADR-081), every `skills/**/SKILL.md` (ADR-038)
+# and the forks' `NOTICE.md` (ADR-044).
+docs
+
+# Runtime state, never build input. Long-term memory especially: baking one
+# team member's notes into the image would ship them to everyone (ADR-035,
+# ADR-065).
+workspace
+memory
+agent_memory_db

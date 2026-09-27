@@ -1,0 +1,35 @@
+.env
+.env.test
+.venv/
+venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Agent sandbox — keep the directory, ignore generated files
+workspace/*
+!workspace/.gitkeep
+
+# Long-term memory — keep the directory, never commit its contents. Memory
+# is written by whoever ran the agent last: it is machine-local state, and
+# committing it would mean one person's notes silently becoming part of
+# everyone else's system prompt.
+memory/*
+!memory/.gitkeep
+
+# The Qdrant volume (ADR-065). Same reasoning as memory/ above, and the
+# stakes are the same: it is written by whoever ran the agent last, and
+# committing it would put one person's stored facts into everyone else's
+# retrieval. Also binary segment files, which do not belong in a diff.
+agent_memory_db/
+
+# Local throwaway virtualenv used for ruff/mypy on a machine without
+# Python 3.12. Not the project toolchain — that is Dockerfile.test.
+.venv-tools/

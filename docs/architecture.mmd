@@ -1,0 +1,351 @@
+%% Agent harness architecture. This is the source of truth; architecture.png
+%% is rendered from it:
+%%   npx -y @mermaid-js/mermaid-cli -i docs/architecture.mmd \
+%%     -o docs/architecture.png -w 2400 -s 2
+%% ---
+%% What attaches around the loop, and where:
+%% ---
+%%   * Observability. Every metric section 8.4 asks for is derived from
+%%     lifecycle callbacks the loop already fired, so telemetry is a Hook
+%%     like any other and the fourteen original metric names are frozen
+%%     against the Grafana dashboard (ADR-081).
+%% ---
+%%     The layer was rebuilt around a SPAN MODEL (ADR-093). There were two
+%%     observers — one for metrics, one for the trace file — each with its
+%%     own stopwatches and each needing an edit to record a new field. Now
+%%     ONE hook opens spans and the Tracer fans finished spans out to three
+%%     exporters. A new telemetry field is one attribute in one place, and
+%%     a dashboard and a trace file cannot disagree about a run because
+%%     they read the same object.
+%% ---
+%%     Spans NEST, which the flat event log could not express: a permission
+%%     decision is a child of the tool call it governed rather than the
+%%     line printed next to it, and a delegated child run is a subtree of
+%%     the parent's delegate call. Every failure carries an error.type and
+%%     the layer responsible for it (ADR-094).
+%%   * A skill-scoped permission wrapper. There is still exactly one gate,
+%%     consulted before every tool call (ADR-057). A loaded skill's
+%%     allowed-tools narrows it and can never widen it (ADR-082).
+%%   * Sub-agents. The delegation hop architecture-future.mmd has drawn
+%%     since Week 1 becomes real: delegate is a tool on the same registry,
+%%     and a child is another AgentLoop with its own context and its own
+%%     registry — which is why loop.py does not change for it either.
+%%   * Traces. The JSONL exporter, one file per run, holding the span tree.
+%%     Metrics answer "how is it doing"; the trace answers "what did this
+%%     one run do". An optional OTLP exporter sends the same spans to
+%%     Jaeger, off by default and unable to fail a run (ADR-095).
+%%   * Task quality, kept apart from run success. A run can answer and
+%%     still not have done what was asked, so a verdict is recorded
+%%     against the run id rather than derived (ADR-096).
+%%   * A budget gate on the model call. Every chat() — the parent's and each
+%%     child's — goes through one BudgetedLLMClient, so a rolling 24-hour
+%%     window and a per-prompt checkpoint are enforced in one place and
+%%     loop.py knows nothing about either (ADR-088, ADR-089). The per-prompt
+%%     stop is a pause: the user types "continue" and the same task resumes.
+%%   * The memory write path. Every long-term write — the memory tools,
+%%     /remember, and an extraction pass over the user's own message at run
+%%     end — goes through ONE MemoryWriter, which consolidates it against
+%%     what is stored: a correction supersedes the old fact, never deletes
+%%     it (ADR-107). Its model calls, like extraction's and the
+%%     conversation summary's, go through the same budgeted, traced client
+%%     as the agent's.
+%%   * Conversation folding. A long REPL chat is folded into a rolling
+%%     summary at the start of a turn, cutting only at user messages so no
+%%     tool call loses its result (ADR-108).
+%%   * A claim check on the agent's model calls. A final answer that says
+%%     "I have created ..." when no tool ran this turn is sent back once;
+%%     the model then acts or corrects itself (ADR-116).
+%%   * Delegation decided at run time. At the first read of a turn the
+%%     coordinator's client asks the model whether the request splits into
+%%     independent parts; a yes reaches the loop as a delegate(tasks=[...])
+%%     call, dispatched and gated like any other (ADR-117).
+%%   * Short-term memory. One markdown file the agent writes itself,
+%%     injected whole every run. It is outside the context window, so
+%%     compaction — which now shrinks tool-call ARGUMENTS as well as
+%%     results, and lists what it removed — cannot reach it (ADR-090).
+%% ---
+%% The LIFECYCLE box is drawn as one trunk rather than an arrow from every
+%% phase, which is not an artistic choice: the loop really does call one
+%% CompositeHook, and that object is the only thing it knows about. Seven
+%% observers behind it is a fan-out the loop cannot see.
+%% ---
+%% Note the ordering, which is load-bearing rather than cosmetic: telemetry
+%% is FIRST so its agent.run span encloses every other hook's work, and
+%% CompositeHook unwinds on_run_end in reverse so it also closes last.
+%% Composed the other way round, the memory hook opened a span with nothing
+%% on the tracer stack and wrote a second trace file for the same run.
+%% ---
+%% Boxes are runtime phases and processes, not Python packages —
+%% architecture.md maps each box to its module.
+flowchart TB
+    User([User])
+    CLI["CLI / User Interface
+    banner names every root, the policy, the metrics URL"]
+    Response["Final Response"]
+
+    User -->|"Task"| CLI
+    CLI -->|"User Request"| Planner
+
+    subgraph AgentSystem["AGENT SYSTEM — one AgentLoop, unchanged since Week 1"]
+        direction TB
+        Planner["Planner / Main Agent
+        role = main
+        • Understand task
+        • Create and update plan
+        • Process tool feedback
+        • Decide next step or finish"]
+        Context["Context
+        • Task · plan · previous results
+        • Injected memory, skills and working notes
+        • Today's date and the week ahead
+        • Compaction: stubs old results AND old
+          tool-call payloads, then lists what it took"]
+        Reasoning["Reasoning / Tool Selection
+        • Decide what to do next
+        • Select tool from Registry"]
+        Planner --> Context
+        Context --> Reasoning
+    end
+
+    subgraph ModelGate["MODEL GATE — one place, before every model call"]
+        direction TB
+        Planner2["DelegationPlanner — the coordinator only
+        at the first read of a turn asks ONE question:
+        does this split into independent parts?
+        yes → the loop gets delegate(tasks=[…]) (ADR-117)"]
+        Grounding["GroundingLLMClient — the agent's calls only
+        a final answer that claims an action
+        with no tool result this turn is
+        sent back ONCE (ADR-116)"]
+        Budgeted["BudgetedLLMClient
+        wraps the real client, built once in session.py
+        • window spent → BudgetExceeded
+        • instruction spent → PromptBudgetExceeded
+        charges the ledger with what the reply reports"]
+        ChatClient["OpenAICompatibleClient
+        InnKube · Gemini · OpenAI · Groq · Ollama …
+        the only HTTP call the harness makes"]
+        Planner2 --> Grounding
+        Grounding --> Budgeted
+        Budgeted -->|"allowed"| ChatClient
+    end
+
+    subgraph Gate["PERMISSION GATE — one place, before every tool call"]
+        direction TB
+        SkillScope["SkillScopedPolicy
+        a loaded skill's allowed-tools
+        narrows the set, never widens it
+        off by default"]
+        Policy["PermissionPolicy
+        risk tiers · deny-list · confirm tier
+        allow · deny · require_user_confirmation"]
+        Confirmer["Confirmer
+        asks on the terminal: yes · no
+        allow for session · deny for session
+        re-asks a typo, fails closed with no terminal"]
+        SkillScope --> Policy
+        Policy -.->|"confirm tier"| Confirmer
+    end
+
+    subgraph Execution["TOOL EXECUTION — one flat list, whatever the origin"]
+        direction TB
+        Tools["Tool Registry & Execution
+        • File tools — workspace root
+        • Memory tools — no path, a collection
+        • skill_read — skills root
+        • Remote MCP tools — server-prefixed
+        • delegate — a tool like any other"]
+        SubAgent["Sub-Agents — researcher | writer | critic
+        • own system prompt, own RunContext
+        • own registry, derived from capabilities
+        • own policy and budget, never wider than the parent's
+        • own deadline, checked at each model call
+        • up to subagent_max_concurrency at once, in a worker pool
+        • no delegate: no role holds the capability
+        • returns a VALIDATED structured result"]
+        McpClient["MCP Client — one per server
+        • Launch over stdio or connect over http
+        • Discover tools at runtime
+        • Refuse destructive tools, then register
+        • Restart a dead session once"]
+        Tools -->|"delegate(role, task) or delegate(tasks=[...])
+        — independent tasks fan out concurrently"| SubAgent
+        SubAgent -->|"its own registry, minus delegate"| Tools
+        Tools -.->|"time_plus__ / calendar__ / web__"| McpClient
+    end
+
+    subgraph Remote["MCP SERVERS — one subprocess each, config.yaml only"]
+        direction TB
+        TimeServer["mcp_server_time_plus
+        forked from the reference server
+        • get_current_time · convert_time
+        • find_meeting_slot · count_working_days"]
+        CalendarServer["mcp_server_calendar
+        forked from ics-calendar-mcp
+        • get_events_today · get_events_range
+        • get_event_details · search_events
+        • list_recurring_events
+        • create_event · suggest_reschedule_slots"]
+        WebServer["mcp_server_web_search
+        • web_search · web_fetch"]
+        CalendarStore[("Calendar volume
+        calendar/calendar.ics
+        a local file, not a feed URL")]
+        CalendarServer -->|"reads / writes .ics"| CalendarStore
+    end
+
+    Lifecycle["LIFECYCLE — one CompositeHook
+    on_run_start · before_llm · after_llm · on_llm_error
+    before_tool · after_permission · after_tool · on_run_end"]
+
+    subgraph Observers["OBSERVERS — the loop knows none of them by name"]
+        direction TB
+        ConversationHook["ConversationSummaryHook — SECOND
+        folds turns older than the last few into
+        a rolling summary once over budget (ADR-108)"]
+        MemoryHook["MemoryHook
+        injects facts, writes the run summary"]
+        ExtractHook["MemoryExtractionHook
+        at run end, reads the USER's message only
+        and proposes facts to the MemoryWriter (ADR-107)"]
+        SkillsHook["SkillsHook
+        injects the skill index"]
+        NotesHook["NotesHook
+        injects the working notes, whole,
+        at run start AND before each request
+        when the file changed (ADR-105)"]
+        Telemetry["TelemetryHook — FIRST, so its span encloses the rest
+        opens agent.run · agent.iteration · llm.call
+        tool.call · permission.check · memory.* · subagent.run
+        one instrumentation point, no stopwatches anywhere else"]
+        ConsoleHook["ConsoleTraceHook
+        the arrows a human watches"]
+    end
+
+    subgraph Persistence["PERSISTENT STATE — outside the workspace"]
+        direction TB
+        Writer["MemoryWriter — every long-term write
+        exact repeat → skip · judge: add / update / duplicate
+        update = new record + supersede the old one
+        user outranks harness outranks agent"]
+        Memory[("Qdrant — agent_memory
+        core_fact · project_note
+        cosine + recency decay · superseded hidden
+        core facts: every one up to 10, relevant first (ADR-118)")]
+        Writer --> Memory
+        Skills[("Skills
+        SKILL.md bundles, read-only")]
+        SessionLog[("Run log
+        memory/sessions.md")]
+        Traces[("Traces
+        memory/traces/*.jsonl
+        memory/traces/delegations/*.json")]
+        Notes[("Working notes
+        memory/notes.md
+        the agent's own state for this task")]
+        Ledger[("Budget ledger
+        memory/budget.json
+        window start · spend · credit")]
+    end
+
+    Tracer["TRACER — one stack of open spans PER THREAD
+    trace_id IS the run id · parentage is the stack
+    a concurrent child adopts its parent's span, so the
+    tree still joins across the worker boundary
+    an exporter that raises loses a span, never a run"]
+
+    subgraph Exporters["EXPORTERS — one span in, three sinks out"]
+        direction TB
+        JsonlExp["JsonlSpanExporter
+        one file per run, span tree
+        v1 keys kept · schema_version: 2"]
+        MetricsExp["MetricsSpanExporter
+        spans to counters
+        25 names · no run_id label"]
+        OtlpExp["OtlpSpanExporter
+        OPTIONAL, off by default
+        gen_ai.* semconv · batched off-thread"]
+    end
+
+    subgraph Observability["OBSERVABILITY — scraped, never pushed"]
+        direction TB
+        Exporter["/metrics on :9091
+        a closed port is a banner line, not a crash"]
+        Prometheus["Prometheus
+        scrapes harness:9091 · 5 alert rules"]
+        Grafana["Grafana
+        row 0: failures BY LAYER — the panel you open first
+        rows 1-7: the brief's bullets
+        rows 8-11: diagnosis · context · memory · task quality"]
+        Jaeger["Jaeger — optional
+        the same run as a flame graph
+        found by the id the banner printed"]
+        Exporter -->|"HTTP pull"| Prometheus
+        Prometheus --> Grafana
+    end
+
+    %% Every model call, the parent's and each child's, through one client.
+    Planner -->|"chat(messages, tools)"| Planner2
+    Budgeted <-->|"charge · read"| Ledger
+    Budgeted -.->|"budget stop — the REPL survives;
+    'continue' resumes, 'use credit on the go' overrides"| CLI
+    SubAgent -.->|"the same client instance"| Grounding
+
+    %% The act half of the cycle: propose, gate, execute, feed back.
+    Reasoning -->|"Proposed tool call"| SkillScope
+    Policy -->|"allow · confirmed"| Tools
+    Policy -.->|"deny · declined — a refusal is an observation,
+    and counts as a failure for that tool"| Planner
+    Tools -->|"Result / Error Feedback"| Planner
+    SubAgent -->|"DelegationResult — status, validated payload,
+    summary clipped to budget, path to the full record"| Planner
+    SubAgent -.->|"its own run_start / llm / tool / run_end"| Lifecycle
+
+    %% Tools that reach state, and the one that narrows the gate.
+    Tools -->|"memory tools"| Writer
+    CLI -->|"/remember"| Writer
+    ExtractHook -->|"proposed facts"| Writer
+    Writer -.->|"judge call"| Budgeted
+    ExtractHook -.->|"extract call"| Budgeted
+    ConversationHook -.->|"summary call"| Budgeted
+    Tools -->|"note_write · note_append"| Notes
+    Tools -->|"skill_read narrows the gate
+    until /reset"| SkillScope
+    McpClient <-->|"MCP over stdin / stdout"| TimeServer
+    McpClient <-->|"MCP over stdin / stdout"| CalendarServer
+    McpClient <-->|"MCP over stdin / stdout"| WebServer
+
+    %% The observe half: one trunk in, five observers out.
+    Planner -.-> Lifecycle
+    Gate -.-> Lifecycle
+    Tools -.-> Lifecycle
+    Lifecycle --> Telemetry
+    Lifecycle --> ConversationHook
+    Lifecycle --> MemoryHook
+    Lifecycle --> ExtractHook
+    Lifecycle --> SkillsHook
+    Lifecycle --> NotesHook
+    Lifecycle --> ConsoleHook
+    Telemetry -->|"opens / closes spans"| Tracer
+    MemoryHook -.->|"memory.read / memory.write
+    the retrieval that goes through no tool call"| Tracer
+    Tracer --> JsonlExp
+    Tracer --> MetricsExp
+    Tracer -.-> OtlpExp
+
+    Memory -.->|"query on the task"| MemoryHook
+    Skills -.->|"index at startup"| SkillsHook
+    Notes -.->|"read at run start and per request"| NotesHook
+    ConversationHook -->|"fold · summary section"| Context
+    MemoryHook -->|"inject"| Context
+    SkillsHook -->|"inject"| Context
+    NotesHook -->|"inject"| Context
+    MemoryHook -->|"summary at run end"| SessionLog
+    JsonlExp --> Traces
+    MetricsExp --> Exporter
+    OtlpExp -.->|"OTLP/HTTP :4318"| Jaeger
+
+    Planner -->|"Task Complete"| Response
+    Response --> CLI
+    CLI --> User
+

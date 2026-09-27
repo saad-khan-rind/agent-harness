@@ -1,0 +1,16 @@
+# Grafana dashboard provisioning (ADR-083). Every JSON file in this directory
+# becomes a dashboard at start-up — committed to git, so a TA gets the seven
+# panel groups without an "Import" dialog.
+apiVersion: 1
+
+providers:
+  - name: harness
+    folder: ""
+    type: file
+    disableDeletion: false
+    # Re-read on change so editing the JSON on the host shows up on refresh.
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

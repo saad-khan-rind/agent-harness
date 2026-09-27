@@ -1,0 +1,58 @@
+{
+  "flat": {
+    "surface": "flat",
+    "attempts": 15,
+    "correct_operation": 15,
+    "goal_reached": 15,
+    "valid_calls": 20,
+    "total_calls": 20,
+    "iterations": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      3,
+      3,
+      3,
+      3
+    ],
+    "errors": [],
+    "rejections": []
+  },
+  "command": {
+    "surface": "command",
+    "attempts": 15,
+    "correct_operation": 15,
+    "goal_reached": 15,
+    "valid_calls": 20,
+    "total_calls": 25,
+    "iterations": [
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3,
+      3
+    ],
+    "errors": [],
+    "rejections": [
+      "Error: No such file or directory: MEMORY.md"
+    ]
+  }
+}

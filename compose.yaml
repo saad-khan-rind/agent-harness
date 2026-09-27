@@ -1,0 +1,350 @@
+# Convenience wrappers around the `docker run` commands in README.md. The
+# brief requires the plain `docker run` / `podman run` path to work on its
+# own, so nothing here may become load-bearing.
+#
+# One file, both engines. `docker compose`, `podman compose` and
+# `podman-compose` all read it unchanged; the only engine-specific parts are
+# two interpolated variables — `SELINUX_SUFFIX` for the host binds and
+# `ENGINE_SOCKET` for the test service — each of which has a Docker-shaped
+# default, so nothing has to be set to use Docker (ADR-104).
+#
+# Project name is pinned so it does not follow the folder name. The default
+# would be `agent-harness` today and something else after a rename, which would
+# silently mint a second pair of volumes (ADR-054).
+name: agent-harness
+
+services:
+  # The vector database that backs long-term memory (ADR-065).
+  #
+  # `docker compose up -d qdrant` before the first agent run, or let
+  # `docker compose run harness` start it: the dependency below does that
+  # automatically. It is the one service that must be up *before* the
+  # harness stores anything — though not before the harness starts, which
+  # is the point of the lazy connect and the graceful degradation.
+  qdrant:
+    # Pinned, not :latest. qdrant-client 1.15.1 warns loudly when the
+    # server's minor version is more than one ahead, and :latest drifted to
+    # 1.19 — so the first thing a demo showed was a red-looking
+    # incompatibility warning above the banner. A pin also makes the
+    # database the same on every machine, which is what the container is
+    # for. Bump it and the client together (ADR-079).
+    image: qdrant/qdrant:v1.15.4
+    # Published so the dashboard at http://localhost:6333/dashboard works
+    # from the host during a demo, which is the fastest way to show that
+    # what the agent claimed to remember is actually a row somewhere.
+    ports:
+      - "6333:6333"
+    volumes:
+      # A host bind, not a named volume, and deliberately different from
+      # the choice ADR-030 made for the agent's own roots. The reason the
+      # agent needs named volumes — the non-root uid 1000 inside our image
+      # cannot write a host folder owned by someone else — does not apply
+      # here: the official Qdrant image runs as root, so it owns whatever
+      # it is given. What a bind buys is that the database is visible in
+      # the checkout, backed up by copying a folder, and inspectable
+      # without a throwaway container (ADR-069).
+      # ``${SELINUX_SUFFIX}`` is empty on Docker Desktop, on a Mac and on any
+      # host without SELinux, and ``,Z`` on Fedora/RHEL/CentOS, where a bind
+      # the container cannot read looks exactly like a missing folder.
+      # scripts/run.sh sets it from the kernel; a plain compose invocation
+      # gets the harmless default (ADR-104).
+      - ./agent_memory_db:/qdrant/storage${SELINUX_SUFFIX:-}
+    # A dead Qdrant is a degraded harness, not a broken one, so nothing
+    # here blocks on health. The check exists so `docker compose ps` says
+    # whether memory will work before a demo starts rather than after.
+    healthcheck:
+      # The image ships no curl, wget, or Python — the last of those used
+      # to be true of an older tag, which is why a python3 check sat here
+      # and why `docker compose ps` then said unhealthy while the process
+      # was fine. bash is present; /dev/tcp is enough to hit `/readyz`.
+      # That endpoint rather than `/healthz` because it reports collections
+      # are loaded, which is the thing the harness is about to need.
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c "exec 3<>/dev/tcp/127.0.0.1/6333;
+          printf 'GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3;
+          grep -q 'HTTP/.* 200' <&3"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # The agent: `docker compose run --build --rm harness`
+  #
+  # `--build`, not because compose cannot find the image, but because it
+  # can: `docker compose run` reuses an existing `agent-harness` image and
+  # never rebuilds on its own, so without it a code change quietly does not
+  # reach the container you are testing.
+  harness:
+    build: .
+    image: agent-harness
+    env_file: .env
+    # A `run` target, not an `up` target: it is an interactive REPL, so
+    # `docker compose up -d` starting it in the background would leave a
+    # container with nobody attached to its stdin. The profile is what makes
+    # a bare `docker compose up -d` mean "bring up the things the agent
+    # talks to" — Compose enables a named service's profile automatically,
+    # so `docker compose run --rm harness` still works with no extra flag
+    # (ADR-098).
+    profiles: ["cli"]
+    # Started, not waited for. `service_started` rather than
+    # `service_healthy` on purpose: the harness is designed to run with no
+    # memory backend at all, so blocking the REPL for up to fifty seconds
+    # on a health check would trade a working degraded start for a slow
+    # one. The banner says which of the two happened.
+    depends_on:
+      qdrant:
+        condition: service_started
+    environment:
+      # Inside the compose network the database answers to its service
+      # name, not to localhost. This override is why `config.yaml` can
+      # default to localhost for a developer running the harness outside a
+      # container without breaking the containerised path.
+      - MEMORY_QDRANT_URL=http://qdrant:6333
+      # Bare names: pass these through from the host shell **only when they
+      # are set there**, so an unset variable falls through to `.env` and
+      # then to `config.yaml` rather than being overwritten with a default.
+      # That ordering is what lets `scripts/run.sh --tracing` switch tracing
+      # on for one session without editing either file, while somebody who
+      # put `OTLP_ENABLED=true` in their own `.env` keeps it (ADR-098).
+      - OTLP_ENABLED
+      # Unlike the others, a default: inside this network Jaeger answers to
+      # its service name, and config.yaml's `localhost:4318` is the harness
+      # container itself — so switching tracing on sent every span nowhere,
+      # silently, unless you came in through `run.sh --tracing` (ADR-111).
+      # `${VAR:-default}` still takes a value from the shell or from `.env`.
+      - OTLP_ENDPOINT=${OTLP_ENDPOINT:-http://jaeger:4318}
+      - OTLP_UI_URL
+      - TELEMETRY_REDACTION
+      # OpenTelemetry's own name for a hosted collector's credential. Passed
+      # through rather than stored, because this file is committed.
+      - OTEL_EXPORTER_OTLP_HEADERS
+    ports:
+      # The Prometheus endpoint. Published so `curl localhost:9091/metrics`
+      # works from the host during a demo; a Prometheus service inside this
+      # network would reach `harness:9091` without it. Must stay in step
+      # with `metrics_port` in config.yaml — tests/unit/test_compose_volumes.py
+      # asserts that (ADR-081).
+      - "9091:9091"
+    # Both are needed for an interactive REPL: stdin_open keeps stdin
+    # attached, tty allocates the terminal that makes input() echo.
+    stdin_open: true
+    tty: true
+    volumes:
+      # Named volumes, not host folders. Docker creates each on first use
+      # with the image's ownership (uid 1000), so the non-root agent can
+      # always write — a bind-mounted host folder keeps the host's uid
+      # instead and denies writes on any machine whose user is not 1000
+      # (ADR-030).
+      #
+      # These outlive `--rm`, `docker compose down`, container kills, and
+      # `docker rmi`. They are not `external`: a missing volume is created,
+      # not treated as an error. Wipe them deliberately with:
+      #   docker volume rm agent-harness-workspace agent-harness-memory agent-harness-calendar
+      # `docker compose down -v` also deletes them — do not pass `-v`
+      # unless that is what you want.
+      - agent-harness-workspace:/app/workspace
+      # Long-term memory, on its own volume for the same ownership reason
+      # and one more: it is a separate root from the workspace precisely so
+      # the file tools cannot reach it (ADR-035). Mounting it *inside*
+      # /app/workspace would silently undo that, which is why the harness
+      # refuses to start if the two paths overlap.
+      - agent-harness-memory:/app/memory
+      # The calendar, on its own volume for the same ownership reason as
+      # the other two. It holds one file, calendar.ics, named by
+      # --calendar-file in config.yaml. It is a *fourth* root and it belongs
+      # to the calendar server, not to the harness: the file tools are
+      # confined to /app/workspace, so nothing the agent runs locally can
+      # reach it — only the calendar server's own tools can, over the
+      # protocol (ADR-071).
+      - agent-harness-calendar:/app/calendar
+      # Read-only host bind, not a volume. Config is input to the harness,
+      # never something the agent should rewrite from inside its sandbox.
+      # Compose-only convenience so a YAML edit is picked up without a
+      # rebuild; the graded `docker run` path uses the copy baked into the
+      # image.
+      - ./config.yaml:/app/config.yaml:ro${SELINUX_SUFFIX:-}
+
+  # The observability stack: `docker compose up -d prometheus grafana`
+  #
+  # Two services, neither of which the harness depends on: the agent runs
+  # exactly the same with both stopped, and the bare `docker run` path the
+  # brief grades needs neither. They are here so a TA gets the §8.4
+  # dashboard with one command and no clicking (ADR-083).
+  prometheus:
+    # Pinned, like Qdrant: the tag we tested against, not whatever `latest`
+    # means on demo day.
+    image: prom/prometheus:v3.2.1
+    volumes:
+      # Read-only host bind: the scrape config is input, never something a
+      # running container should rewrite.
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The alert rules `prometheus.yml` points at. Mounted as its
+      # own file rather than inlined, so `promtool check rules` can be
+      # run against it directly (ADR-097).
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    # `docker compose run harness` names the one-off container
+    # `agent-harness-harness-run-<id>` and does not register the DNS alias `harness`
+    # unless `--use-aliases` is passed. The scrape file still targets
+    # `harness:9091`, so without this mapping Prometheus reports
+    # `lookup harness: no such host` and Grafana stays empty even while
+    # `curl localhost:9091/metrics` already shows numbers (ADR-092).
+    extra_hosts:
+      - "harness:host-gateway"
+    # Published for a person with a browser (http://localhost:9090); Grafana
+    # reaches it as `prometheus:9090` over the compose network regardless.
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    volumes:
+      # Datasource and dashboards as code. Grafana reads this tree at
+      # start-up, so the seven panel groups exist before anyone logs in.
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    environment:
+      # admin / admin, stated plainly. This is a lab dashboard on a laptop
+      # loopback, not a product; the README says so and says not to expose
+      # the port beyond that.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # The provisioned dashboard is the landing page, so `localhost:3000`
+      # goes straight to the panels rather than to an empty home screen.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/harness.json
+    depends_on:
+      prometheus:
+        condition: service_started
+
+  # Trace viewing: `./run.sh --tracing`, or `docker compose --profile tracing
+  # up -d` plus `otlp_enabled: true` in config.yaml (or OTLP_ENABLED=true in
+  # .env). Open http://localhost:16686; the agent prints a direct link to
+  # each run's trace after its answer.
+  #
+  # Optional in the strongest sense: not in the default `up`, not depended on
+  # by anything, and the harness does not know whether it is there. With
+  # `otlp_enabled: false` (the shipped default) nothing is ever sent; with it
+  # true and this container stopped, the SDK retries on its own background
+  # thread and drops, and the agent waits for none of it (ADR-095).
+  #
+  # Grafana and Prometheus answer "how is the fleet doing". This answers
+  # "what did this one run do", for somebody who would rather read a flame
+  # graph than `/trace` in a terminal. It does NOT replace Prometheus, which
+  # the brief requires and which stays exactly as it was.
+  #
+  # `all-in-one` is the single-container Jaeger: collector, storage and UI in
+  # one process, storing in memory. Right for a laptop and wrong for anything
+  # else, which is why it is not in the default stack.
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    # Behind a profile so it is opt-in at the command line as well as in
+    # config: `docker compose --profile tracing up -d`. Trace *viewing* is
+    # the one piece of this stack nobody needs to answer the brief.
+    profiles: ["tracing"]
+    environment:
+      # Accept OTLP directly, so no separate OpenTelemetry Collector is
+      # needed. A collector is the right shape for a real deployment — it is
+      # where sampling and redaction policy live — and is one more moving
+      # part than a demo needs.
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      # The UI.
+      - "16686:16686"
+      # OTLP over HTTP, which is what `otlp_endpoint` points at by default.
+      - "4318:4318"
+
+  # The quality gate: `docker compose run --build --rm tests`
+  #
+  # Same reason for `--build` as above, and it bites harder here: a stale
+  # image reports a passing gate for code that is no longer what you wrote.
+  # A test count that has not moved since your last change is the symptom.
+  #
+  # Deliberately no env_file and no workspace/memory volumes. The suite
+  # must pass with no InnKube token, and it must not be able to touch
+  # whatever the agent produced during a demo — the test image carries its
+  # own empty roots.
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: agent-harness-tests
+    # Behind a profile for the obvious reason: `docker compose up -d` must
+    # not run the test suite. Named explicitly it still does — Compose
+    # enables the profile of any service on the command line.
+    profiles: ["test"]
+    # The end-to-end tier needs to start containers, and a container cannot
+    # start containers on its own. These three settings are what let
+    # `docker compose run --rm tests` run it when `.env.test` exists and skip
+    # it when it does not (ADR-077).
+    environment:
+      # The build context and the `.env.test` location for tests/e2e. Points
+      # at the read-only mount below rather than at /app, because /app is a
+      # *copy* made by Dockerfile.test — no .dockerignore, no .env.test — and
+      # an image built from a subtly different context is worth less as
+      # evidence than one built from the real thing.
+      AGENT_HARNESS_E2E_CONTEXT: /host
+    # Group 0, not user 0. The container keeps running as the unprivileged
+    # `agent` — which is what lets the two read-only-config tests execute
+    # here and skip for root — and gains only the group that can open the
+    # socket. On Docker Desktop that socket is root:root 0660, so gid 0 is
+    # enough; on a Linux host it is usually root:docker, so pass the real one:
+    #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock) docker compose run --rm tests
+    group_add:
+      - "${DOCKER_GID:-0}"
+    # SELinux, which Podman enforces by default — including inside the
+    # Fedora CoreOS VM that `podman machine` runs on a Mac. Group 0 is not
+    # enough there: the label on the engine socket refuses any connection
+    # from a confined container, so every end-to-end test failed with
+    # "permission denied" on the socket while Docker Desktop passed. This is
+    # what Podman's own documentation prescribes for a mounted socket, and
+    # Docker, with no SELinux to switch off, accepts it and changes nothing
+    # (ADR-115).
+    security_opt:
+      - label=disable
+    volumes:
+      # Coverage reports written back to the host so they can be opened in a
+      # browser: htmlcov/index.html.
+      - ./htmlcov:/app/htmlcov
+      # The host's Docker daemon. Say plainly what this is: a container with
+      # this socket can create, start and delete containers, images and
+      # volumes on the host, which is close to root. It is here because the
+      # end-to-end tier's whole premise is running the *shipped image*, and
+      # that cannot be faked from inside another container.
+      #
+      # It is on this service only. The `harness` service — the one a TA
+      # actually runs the agent in — does not get it, and must not: the
+      # agent's sandbox is the container, and handing the thing inside the
+      # sandbox control of the sandbox would make ADR-007's confinement
+      # decorative.
+      #
+      # Podman is daemonless but ships a compatible socket; point
+      # ``ENGINE_SOCKET`` at it to run the same tier there:
+      #   systemctl --user start podman.socket
+      #   ENGINE_SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock \
+      #     podman compose run --rm tests
+      # The path inside the container stays /var/run/docker.sock because
+      # that is what the docker CLI in the test image looks for (ADR-104).
+      - ${ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # The real repository, read-only: the build context for the image under
+      # test, and where `.env.test` is read from. Read-only because nothing
+      # here writes to it, and a gate that can rewrite the source it is
+      # checking is not a gate.
+      - .:/host:ro
+
+volumes:
+  # `name:` pins the Docker volume to the same identifier `docker run -v`
+  # uses. Without it, compose prefixes the project name and
+  # `agent-harness-workspace` (run) and `agent-harness_agent-harness-workspace` (compose) are
+  # two different disks — work done in one launch path is invisible to the
+  # other (ADR-054).
+  #
+  # Not marked `external`, so a missing volume is created on first use
+  # rather than failing the start.
+  agent-harness-workspace:
+    name: agent-harness-workspace
+  agent-harness-memory:
+    name: agent-harness-memory
+  agent-harness-calendar:
+    name: agent-harness-calendar

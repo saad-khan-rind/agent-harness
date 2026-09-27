@@ -1,0 +1,16 @@
+# Grafana datasource provisioning (ADR-083). Loaded at container start, so
+# nobody clicks "Add data source" before a demo.
+#
+# The uid is fixed because the dashboard JSON refers to it; a generated uid
+# would leave every panel pointing at a datasource that does not exist.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # The service name inside the compose network, not localhost.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
